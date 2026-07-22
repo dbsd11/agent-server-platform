@@ -29,3 +29,29 @@ class MessageRepository(BaseRepository[Message]):
             "id": {"operator": ">", "condition": offset},
         }
         return self.find_by_criteria(criteria, order_by="id ASC", limit=limit)
+
+    def find_pending_dispatch_global(self, consumer_id: str, limit: int = 100) -> List[Message]:
+        """Find unconsumed dispatch messages across ALL scenarios (global consumer).
+
+        Used by the CentralDispatcher: queries dispatch rows with id > the
+        global consumer offset, ordered id ASC, regardless of scenario_id.
+        """
+        from .consumer_offset_repository import ConsumerOffsetRepository
+        offset_repo = ConsumerOffsetRepository()
+        offset = offset_repo.get_offset(consumer_id)
+
+        criteria = {
+            "message_type": "dispatch",
+            "id": {"operator": ">", "condition": offset},
+        }
+        return self.find_by_criteria(criteria, order_by="id ASC", limit=limit)
+
+    def max_message_id(self) -> int:
+        """Return MAX(id) over the messages table, or 0 if empty."""
+        from ..connection import get_connection_manager
+        cm = get_connection_manager()
+        with cm.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT COALESCE(MAX(id), 0) AS m FROM {self.table_name}")
+            row = cursor.fetchone()
+            return int(row["m"]) if row else 0

@@ -16,6 +16,7 @@ class Task(BaseModel):
         "parent_task_id": str,  # For task hierarchies
         "topic_id": str,        # Groups subtasks from same decomposition (子主题)
         "idempotency_key": str, # Prevents duplicate task creation (幂等控制)
+        "depends_on": str,    # JSON array of predecessor task_ids (DAG deps)
         "goal": str,
         "state": str,  # TaskState enum: pending, running, waiting, success, failed, timeout, cancelled
         "priority": int,

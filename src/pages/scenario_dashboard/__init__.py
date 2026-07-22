@@ -9,7 +9,48 @@ from scenarios.examples.simple_qa_scenario import SimpleQAScenario
 from scenarios.examples.code_execution_scenario import CodeExecutionScenario
 from database.repositories.task_repository import TaskRepository
 from database.repositories.scenario_repository import ScenarioRepository
+from database.repositories.execution_server_repository import ExecutionServerRepository
 from pages.scenario_dashboard.export_html import build_message_history, write_export_file
+
+
+def server_choices():
+    """Dropdown choices for the per-role execution-server selector.
+
+    Returns a list of (label, value) pairs: a "local" option (empty value =>
+    execute in the backend) plus every registered execution-agent-server.
+    """
+    choices = [("本地（后端执行）", "")]
+    try:
+        for s in ExecutionServerRepository().list_all():
+            choices.append((f"{s.name} ({s.server_id})", s.server_id))
+    except Exception:
+        pass
+    return choices
+
+
+# States from which a scenario can be (re)started: a fresh `initializing`
+# scenario, or a `cancelled` (stopped) one. Running scenarios are blocked
+# (double-start), and completed/failed are terminal (must re-create/clone).
+STARTABLE_STATES = {"initializing", "cancelled"}
+
+
+def start_guard(status):
+    """Pre-flight check before starting a scenario.
+
+    Returns (blocked: bool, msg: str). blocked=False → proceed to start.
+    Only `initializing` and `cancelled` (stopped) scenarios may start;
+    running/starting are blocked as in-flight, completed/failed as terminal.
+    """
+    if not status:
+        return True, "❌ 场景未找到"
+    state = status.get("state")
+    if state in ("running", "starting"):
+        return True, f"⏳ 场景正在运行中（{state}），无需重复启动"
+    if state in ("completed", "failed"):
+        return True, f"🔒 场景已结束（{state}），无法重启，请新建或克隆场景"
+    if state not in STARTABLE_STATES:
+        return True, f"❌ 当前状态（{state}）不支持启动"
+    return False, ""
 
 # ponytail: inline registry, add new scenarios here
 SCENARIO_REGISTRY = {
@@ -162,8 +203,10 @@ def create_page(global_state_component):
                                     outputs=[show_clone_trigger]
                                 )
 
-                                # Start button (only if not running)
-                                if scenario_state not in ["running", "starting"]:
+                                # Start button: only for fresh (initializing) or
+                                # stopped (cancelled) scenarios — the only
+                                # states from which a scenario can (re)start.
+                                if scenario_state in STARTABLE_STATES:
                                     start_btn = gr.Button("▶️", size="sm", variant="primary", elem_classes=["action-btn-small"])
                                     start_btn.click(
                                         fn=lambda id: gr.update(value=f"{id}@start"),
@@ -229,10 +272,17 @@ def create_page(global_state_component):
                             placeholder="例如：你是一个代码执行专家，负责执行代码并返回结果。",
                             lines=2
                         )
+                        server_input = gr.Dropdown(
+                            label=f"角色 {i + 1} 执行服务器",
+                            choices=server_choices(),
+                            value="",
+                            allow_custom_value=False,
+                        )
                         role_inputs.append({
                             "group": role_group,
                             "name": name_input,
-                            "role": role_input
+                            "role": role_input,
+                            "server": server_input,
                         })
 
                 # Add/Remove buttons
@@ -315,6 +365,10 @@ def create_page(global_state_component):
 
             detail_refresh_timer = gr.Timer(value=5, render=False)
 
+            # Refresh execution-server dropdown choices periodically so newly
+            # registered servers appear without a page reload.
+            server_refresh_timer = gr.Timer(value=10, render=False)
+
         # ═══════════════════════════════════════════════════════════════
         # Helper functions
         # ═══════════════════════════════════════════════════════════════
@@ -356,17 +410,20 @@ def create_page(global_state_component):
                            r3_name, r3_role, r4_name, r4_role, r5_name, r5_role,
                            r6_name, r6_role, r7_name, r7_role, r8_name, r8_role,
                            r9_name, r9_role,
+                           # 10 execution-server selectors (one per role)
+                           r0_server, r1_server, r2_server, r3_server, r4_server,
+                           r5_server, r6_server, r7_server, r8_server, r9_server,
                            qa_question, qa_timeout,
                            code_script, code_code, code_timeout):
             """Create a new scenario via ScenarioManager.
 
-            Inputs: 30 (5 header + 20 role fields + 5 config).
-            Outputs: 31 — status_msg + the 30 form fields. The form fields are
+            Inputs: 40 (5 header + 20 role fields + 10 server fields + 5 config).
+            Outputs: 41 — status_msg + the 40 form fields. The form fields are
             returned as no-op gr.update() because the chained hide_create_view
             (.then) resets them and switches back to the list.
             """
-            # 30 no-op updates for the form fields (everything after status_msg)
-            noop = tuple(gr.update() for _ in range(30))
+            # 40 no-op updates for the form fields (everything after status_msg)
+            noop = tuple(gr.update() for _ in range(40))
 
             try:
                 # Build agent roles configuration
@@ -384,6 +441,10 @@ def create_page(global_state_component):
                     r6_name, r6_role, r7_name, r7_role, r8_name, r8_role,
                     r9_name, r9_role,
                 ]
+                server_values = [
+                    r0_server, r1_server, r2_server, r3_server, r4_server,
+                    r5_server, r6_server, r7_server, r8_server, r9_server,
+                ]
 
                 # Parse execution agents: [name1, role1, name2, role2, ...]
                 if execution_roles_count and execution_roles_count > 0 and role_values:
@@ -394,10 +455,12 @@ def create_page(global_state_component):
                             name = role_values[name_idx]
                             role = role_values[role_idx]
                             if name and role:  # Only add if both name and role are provided
-                                agent_roles["execution_agents"].append({
-                                    "name": name,
-                                    "role": role
-                                })
+                                entry = {"name": name, "role": role}
+                                # Attach the per-role execution server (if selected)
+                                sid = server_values[i] if i < len(server_values) else None
+                                if sid:
+                                    entry["server_id"] = sid
+                                agent_roles["execution_agents"].append(entry)
 
                 # Build config based on scenario type
                 config = {
@@ -433,8 +496,16 @@ def create_page(global_state_component):
                 return (f"❌ 错误: {str(e)}",) + noop
 
         def show_create_view():
-            """Show create view and hide list"""
-            return gr.update(visible=False), gr.update(visible=True), gr.update(visible=False), gr.update(visible=False)
+            """Show create view and hide list.
+
+            Also refreshes the execution-server dropdown choices so a server
+            that registered after page-build (backend startup) appears — the
+            choices are otherwise frozen at construction time.
+            """
+            server_upd = gr.update(choices=server_choices())
+            return (gr.update(visible=False), gr.update(visible=True),
+                    gr.update(visible=False), gr.update(visible=False),
+                    *[server_upd for _ in range(10)])
 
         def show_clone_view(scenario_id):
             """
@@ -454,6 +525,7 @@ def create_page(global_state_component):
             sched_val = gr.update()
             count_val = gr.update()
             role_vals = [gr.update() for _ in range(20)]
+            server_vals = [gr.update() for _ in range(10)]
             qa_q, qa_t = gr.update(), gr.update()
             code_s, code_c, code_t = gr.update(), gr.update(), gr.update()
             status = gr.update()
@@ -461,7 +533,7 @@ def create_page(global_state_component):
             if not scenario_id:
                 return (list_upd, create_upd, action_upd, detail_upd,
                         trigger_val, type_val, name_val, desc_val, sched_val, count_val) + \
-                       tuple(role_vals) + (qa_q, qa_t, code_s, code_c, code_t, status)
+                       tuple(role_vals) + tuple(server_vals) + (qa_q, qa_t, code_s, code_c, code_t, status)
 
             scenario_repo = ScenarioRepository()
             scenario = scenario_repo.find_by_scenario_id(scenario_id)
@@ -469,7 +541,7 @@ def create_page(global_state_component):
                 status = f"❌ 克隆失败: 场景未找到 {scenario_id}"
                 return (gr.update(visible=False), gr.update(visible=True), gr.update(visible=False), gr.update(visible=False),
                         "", gr.update(), gr.update(), gr.update(), gr.update(), gr.update()) + \
-                       tuple(role_vals) + (gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), status)
+                       tuple(role_vals) + tuple(server_vals) + (gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), status)
 
             try:
                 config = json.loads(scenario.config) if scenario.config else {}
@@ -487,12 +559,19 @@ def create_page(global_state_component):
 
             count = max(1, min(len(exec_agents), 10))
             role_vals = []
+            server_vals = []
+            # Refresh choices on clone too, so a server registered after
+            # page-build is selectable for the cloned role's server_id.
+            choices = server_choices()
             for i in range(10):
                 if i < len(exec_agents):
                     role_vals.append(exec_agents[i].get("name", ""))
                     role_vals.append(exec_agents[i].get("role", ""))
+                    sid = exec_agents[i].get("server_id", "") or ""
+                    server_vals.append(gr.update(choices=choices, value=sid))
                 else:
                     role_vals.extend(["", ""])
+                    server_vals.append(gr.update(choices=choices, value=""))
 
             return (gr.update(visible=False), gr.update(visible=True), gr.update(visible=False), gr.update(visible=False),
                     "",
@@ -501,7 +580,7 @@ def create_page(global_state_component):
                     scenario.description or "",
                     sched,
                     count) + \
-                   tuple(role_vals) + (
+                   tuple(role_vals) + tuple(server_vals) + (
                        config.get("question", ""),
                        config.get("timeout", 60),
                        config.get("script", ""),
@@ -523,27 +602,7 @@ def create_page(global_state_component):
             return (gr.update(visible=True), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False),
                     "", "simple_qa", "", "",
                     "你是一个任务调度专家，负责分析用户目标，将其分解为可执行的子任务，并协调执行 Agent 完成任务。",
-                    1) + tuple(role_reset_values) + ("", 60, "", "", 300, "")
-
-        def _start_guard(status):
-            """
-            Pre-flight check before starting a scenario.
-
-            Only `initializing` can transition to `running` (see
-            SCENARIO_STATE_MACHINE). Block re-start of running scenarios
-            (double-click) and terminal scenarios (need re-creation) with a
-            friendly message instead of a raw state-machine error.
-
-            Returns (blocked: bool, msg: str). blocked=False → proceed.
-            """
-            if not status:
-                return True, "❌ 场景未找到"
-            state = status["state"]
-            if state in ("running", "initializing"):
-                return True, f"⏳ 场景正在运行中（{state}），无需重复启动"
-            if state in ("completed", "failed", "cancelled"):
-                return True, f"🔒 场景已结束（{state}），无法重启，请新建或克隆场景"
-            return False, ""
+                    1) + tuple(role_reset_values) + tuple([""] * 10) + ("", 60, "", "", 300, "")
 
         def show_action_view(trigger_value):
             """Show action view and execute action"""
@@ -555,7 +614,7 @@ def create_page(global_state_component):
                 # Auto-execute action
                 result_msg = ""
                 if action == "start" and status:
-                    blocked, msg = _start_guard(status)
+                    blocked, msg = start_guard(status)
                     if blocked:
                         result_msg = msg
                     else:
@@ -595,13 +654,19 @@ def create_page(global_state_component):
             return rows
 
         def show_scenario_detail(scenario_id):
-            """Load scenario detail + message history."""
+            """Load scenario detail + message history + export-button visibility.
+
+            Returns (status, history, scenario_id, export_visible). The export
+            button is shown only once the scenario has reached a terminal
+            state (completed/failed/cancelled) so a half-finished run can't be
+            exported with an incomplete history.
+            """
             if not scenario_id:
-                return {}, [], ""
+                return {}, [], "", gr.update(visible=False)
 
             status = scenario_manager.get_scenario_status(scenario_id)
             if not status:
-                return {"error": "场景未找到"}, [], ""
+                return {"error": "场景未找到"}, [], "", gr.update(visible=False)
 
             # Extract trace_id from scenario context
             scenario_repo = ScenarioRepository()
@@ -615,20 +680,24 @@ def create_page(global_state_component):
                     pass
 
             history = _build_message_history(scenario_id, trace_id)
-            return status, history, scenario_id
+            export_visible = status.get("state") in ("completed", "failed", "cancelled")
+            return status, history, scenario_id, gr.update(visible=export_visible)
 
         def show_detail_view(scenario_id):
             """Show detail view and hide list"""
             if scenario_id:
-                detail, history, detail_id = show_scenario_detail(scenario_id)
+                detail, history, detail_id, export_upd = show_scenario_detail(scenario_id)
                 return (gr.update(visible=False), gr.update(visible=False),
                         gr.update(visible=False), gr.update(visible=True),
-                        detail_id, detail, history)
-            return gr.update(), gr.update(), gr.update(), gr.update(), "", {}, []
+                        detail_id, detail, history, export_upd)
+            return (gr.update(), gr.update(), gr.update(), gr.update(),
+                    "", {}, [], gr.update(visible=False))
 
         def hide_detail_view():
             """Hide detail view and show list"""
-            return gr.update(visible=True), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), "", {}, []
+            return (gr.update(visible=True), gr.update(visible=False),
+                    gr.update(visible=False), gr.update(visible=False),
+                    "", {}, [], gr.update(visible=False))
 
         # ═══════════════════════════════════════════════════════════════
         # Event handlers
@@ -643,7 +712,9 @@ def create_page(global_state_component):
         # New scenario button
         new_scenario_btn.click(
             show_create_view,
-            outputs=[scenario_list_content, scenario_create_content, scenario_action_content, scenario_detail_content]
+            outputs=[scenario_list_content, scenario_create_content,
+                     scenario_action_content, scenario_detail_content]
+                    + [r["server"] for r in role_inputs]
         )
 
         # Create view handlers
@@ -658,10 +729,12 @@ def create_page(global_state_component):
             inputs=[scenario_type, scenario_name, scenario_desc,
                     scheduling_agent_role, execution_roles_count] +
                     [item for r in role_inputs for item in [r["name"], r["role"]]] +
+                    [r["server"] for r in role_inputs] +
                     [qa_question, qa_timeout, code_script, code_code, code_timeout],
             outputs=[status_msg, scenario_type, scenario_name, scenario_desc,
                      scheduling_agent_role, execution_roles_count] +
                     [item for r in role_inputs for item in [r["name"], r["role"]]] +
+                    [r["server"] for r in role_inputs] +
                     [qa_question, qa_timeout, code_script, code_code, code_timeout]
         ).then(
             fn=hide_create_view,
@@ -669,6 +742,7 @@ def create_page(global_state_component):
                      show_create_trigger, scenario_type, scenario_name, scenario_desc,
                      scheduling_agent_role, execution_roles_count] +
                     [item for r in role_inputs for item in [r["name"], r["role"]]] +
+                    [r["server"] for r in role_inputs] +
                     [qa_question, qa_timeout, code_script, code_code, code_timeout, status_msg]
         )
 
@@ -678,6 +752,7 @@ def create_page(global_state_component):
                      show_create_trigger, scenario_type, scenario_name, scenario_desc,
                      scheduling_agent_role, execution_roles_count] +
                     [item for r in role_inputs for item in [r["name"], r["role"]]] +
+                    [r["server"] for r in role_inputs] +
                     [qa_question, qa_timeout, code_script, code_code, code_timeout, status_msg]
         )
 
@@ -701,7 +776,7 @@ def create_page(global_state_component):
                 return "", "❌ 请输入场景ID"
 
             status = scenario_manager.get_scenario_status(scenario_id)
-            blocked, msg = _start_guard(status)
+            blocked, msg = start_guard(status)
             if blocked:
                 return scenario_id, msg
 
@@ -746,13 +821,13 @@ def create_page(global_state_component):
         back_from_detail_btn.click(
             fn=hide_detail_view,
             outputs=[scenario_list_content, scenario_create_content, scenario_action_content, scenario_detail_content,
-                     show_detail_trigger, scenario_detail, message_history]
+                     show_detail_trigger, scenario_detail, message_history, export_html_btn]
         )
 
         refresh_detail_btn.click(
             lambda scenario_id: show_scenario_detail(scenario_id),
             inputs=[detail_id_input],
-            outputs=[scenario_detail, message_history, detail_id_input]
+            outputs=[scenario_detail, message_history, detail_id_input, export_html_btn]
         )
 
         # Export scenario to a self-contained offline HTML file
@@ -765,7 +840,27 @@ def create_page(global_state_component):
         detail_refresh_timer.tick(
             lambda scenario_id: show_scenario_detail(scenario_id),
             inputs=[detail_id_input],
-            outputs=[scenario_detail, message_history, detail_id_input]
+            outputs=[scenario_detail, message_history, detail_id_input, export_html_btn]
+        )
+
+        # Refresh execution-server dropdown choices so newly registered servers
+        # appear without reloading the page. Preserve each dropdown's current
+        # selection (a bare gr.update(choices=...) can reset the value in
+        # Gradio 5.x, making a selected server appear unselectable).
+        def _refresh_server_choices(*current_values):
+            choices = server_choices()
+            valid_values = {v for _, v in choices}
+            upds = []
+            for val in current_values:
+                # keep the current selection if still valid, else default to local
+                preserved = val if val in valid_values else ""
+                upds.append(gr.update(choices=choices, value=preserved))
+            return upds
+
+        server_refresh_timer.tick(
+            fn=_refresh_server_choices,
+            inputs=[r["server"] for r in role_inputs],
+            outputs=[r["server"] for r in role_inputs],
         )
 
         # Trigger-based view switching
@@ -773,7 +868,7 @@ def create_page(global_state_component):
             fn=show_detail_view,
             inputs=[show_detail_trigger],
             outputs=[scenario_list_content, scenario_create_content, scenario_action_content, scenario_detail_content,
-                     detail_id_input, scenario_detail, message_history]
+                     detail_id_input, scenario_detail, message_history, export_html_btn]
         )
 
         show_action_trigger.change(

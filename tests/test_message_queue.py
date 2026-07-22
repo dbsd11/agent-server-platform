@@ -1,27 +1,19 @@
 """
-Unit / integration tests for core/message_queue.py
+Unit tests for the slimmed core/message_queue.py.
 
-Tests:
-- TaskMessage and ReplyMessage dataclasses
-- MessageQueueService dispatch/collect roundtrip
-- Idempotent stop
-- Timeout with partial results
-- Scenario isolation
-- has_scenario
+The queue is now a pure transport: dispatch_subtasks writes dispatch rows,
+collect_replies reads reply rows. Execution is handled by the
+CentralDispatcher (tested separately), so these tests write reply rows
+manually to verify the round-trip.
 """
 import pytest
-import time
 import uuid
 import json
 from datetime import datetime
 
-from core.message_queue import (
-    mqs, TaskMessage, ReplyMessage, MessageQueueService, ExecutionWorker,
-    _STOP_SENTINEL,
-)
-from core.state_machine import TaskState
-from database.repositories.task_repository import TaskRepository
-from database.models.task import Task
+from core.message_queue import mqs, TaskMessage, ReplyMessage
+from database.repositories.message_repository import MessageRepository
+from database.models.message import Message
 
 
 class TestTaskMessage:
@@ -50,182 +42,69 @@ class TestReplyMessage:
         assert msg.result == {}
 
 
-class TestStopSentinel:
-    def test_sentinel_value(self):
-        assert _STOP_SENTINEL == "STOP"
+def _write_reply(scenario_id, task_id, success=True, result=None):
+    """Simulate the CentralDispatcher writing a reply row."""
+    MessageRepository().create(Message(
+        scenario_id=scenario_id,
+        task_id=task_id,
+        from_agent="execution",
+        to_agent="scheduling",
+        message_type="reply",
+        content=json.dumps({
+            "task_id": task_id,
+            "success": success,
+            "result": result or {"output": "done"},
+        }, ensure_ascii=False),
+        timestamp=datetime.now(),
+    ))
 
 
 class TestMessageQueueService:
-    def test_dispatch_and_collect_roundtrip(self):
-        scenario_id = f"test-mqs-{uuid.uuid4().hex[:8]}"
-        task_repo = TaskRepository()
-
-        # Create subtasks in DB
-        sub1_id = f"sub1-{uuid.uuid4().hex[:8]}"
-        sub2_id = f"sub2-{uuid.uuid4().hex[:8]}"
-        for sid, cmd in [(sub1_id, "echo hello"), (sub2_id, "echo world")]:
-            task_repo.create(Task(
-                task_id=sid,
-                goal=f"Subtask {sid}",
-                state=TaskState.PENDING.value,
-                scenario_id=scenario_id,
-                context=json.dumps({"command": cmd}),
-                created_at=datetime.now(),
-                updated_at=datetime.now(),
-            ))
-
-        # Dispatch
-        messages = [
-            TaskMessage(task_id=sub1_id, parent_task_id="",
-                        goal="Subtask 1", context={"command": "echo hello"}),
-            TaskMessage(task_id=sub2_id, parent_task_id="",
-                        goal="Subtask 2", context={"command": "echo world"}),
-        ]
-        mqs.dispatch_subtasks(scenario_id, messages)
-
-        # Collect replies
-        replies = mqs.collect_replies(scenario_id, expected_count=2, timeout=30)
-
-        assert len(replies) == 2
-        reply_ids = {r.task_id for r in replies}
-        assert sub1_id in reply_ids
-        assert sub2_id in reply_ids
-
-        for r in replies:
-            assert r.success is True
-            assert "output" in r.result
-
-        # Verify DB state
-        for sid in [sub1_id, sub2_id]:
-            task = task_repo.find_by_task_id(sid)
-            assert task.state == "success"
-
-        mqs.stop_worker(scenario_id)
-        assert not mqs.has_scenario(scenario_id)
-
-    def test_idempotent_stop(self):
-        scenario_id = f"test-stop-{uuid.uuid4().hex[:8]}"
-        task_repo = TaskRepository()
-
-        task_id = f"t-{uuid.uuid4().hex[:8]}"
-        task_repo.create(Task(
-            task_id=task_id,
-            goal="test",
-            state=TaskState.PENDING.value,
-            scenario_id=scenario_id,
-            context=json.dumps({"command": "echo ok"}),
-            created_at=datetime.now(),
-            updated_at=datetime.now(),
-        ))
-
+    def test_dispatch_writes_dispatch_rows(self):
+        scenario_id = f"mqs-{uuid.uuid4().hex[:8]}"
         mqs.dispatch_subtasks(scenario_id, [
-            TaskMessage(task_id=task_id, parent_task_id="", goal="test",
-                        context={"command": "echo ok"}),
+            TaskMessage(task_id="t1", parent_task_id="p", goal="g1",
+                        context={"role": "math", "server_id": "node-1"}),
+            TaskMessage(task_id="t2", parent_task_id="p", goal="g2",
+                        context={"role": "math"}),
         ])
-        mqs.collect_replies(scenario_id, 1, timeout=10)
 
-        mqs.stop_worker(scenario_id)
-        mqs.stop_worker(scenario_id)  # second stop should not raise
+        rows = MessageRepository().find_by_scenario_id(scenario_id, limit=50)
+        dispatch_rows = [r for r in rows if r.message_type == "dispatch"]
+        assert len(dispatch_rows) == 2
+        # server_id is carried through in the context payload (match by task_id;
+        # row order is timestamp-desc and near-simultaneous)
+        by_task = {json.loads(r.content)["task_id"]: json.loads(r.content)
+                   for r in dispatch_rows}
+        assert by_task["t1"]["context"].get("server_id") == "node-1"
+        assert "server_id" not in by_task["t2"]["context"]
 
-    def test_timeout_returns_partial(self):
-        scenario_id = f"test-timeout-{uuid.uuid4().hex[:8]}"
-        task_repo = TaskRepository()
+    def test_collect_replies_roundtrip(self):
+        scenario_id = f"rt-{uuid.uuid4().hex[:8]}"
+        mqs.dispatch_subtasks(scenario_id, [
+            TaskMessage(task_id="t1", parent_task_id="", goal="g1", context={}),
+        ])
+        _write_reply(scenario_id, "t1", True, {"output": "42"})
 
-        fast1_id = f"fast1-{uuid.uuid4().hex[:8]}"
-        fast2_id = f"fast2-{uuid.uuid4().hex[:8]}"
-        slow_id = f"slow-{uuid.uuid4().hex[:8]}"
+        replies = mqs.collect_replies(scenario_id, expected_count=1, timeout=5)
+        assert len(replies) == 1
+        assert replies[0].task_id == "t1"
+        assert replies[0].success is True
+        assert replies[0].result == {"output": "42"}
 
-        for sid, cmd in [
-            (fast1_id, "echo fast1"),
-            (fast2_id, "echo fast2"),
-            (slow_id, "sleep 10"),
-        ]:
-            task_repo.create(Task(
-                task_id=sid,
-                goal=f"task {sid}",
-                state=TaskState.PENDING.value,
-                scenario_id=scenario_id,
-                context=json.dumps({"command": cmd}),
-                created_at=datetime.now(),
-                updated_at=datetime.now(),
-            ))
-
-        messages = [
-            TaskMessage(task_id=fast1_id, parent_task_id="", goal="fast1",
-                        context={"command": "echo fast1"}),
-            TaskMessage(task_id=fast2_id, parent_task_id="", goal="fast2",
-                        context={"command": "echo fast2"}),
-            TaskMessage(task_id=slow_id, parent_task_id="", goal="slow",
-                        context={"command": "sleep 10"}),
-        ]
-        mqs.dispatch_subtasks(scenario_id, messages)
-
-        replies = mqs.collect_replies(scenario_id, expected_count=3, timeout=5)
-
-        assert len(replies) >= 2
-        fast_reply_ids = {r.task_id for r in replies}
-        assert fast1_id in fast_reply_ids
-        assert fast2_id in fast_reply_ids
-
-        mqs.stop_worker(scenario_id)
+    def test_collect_timeout_returns_partial(self):
+        scenario_id = f"to-{uuid.uuid4().hex[:8]}"
+        # No reply rows written -> collect times out with whatever it has.
+        replies = mqs.collect_replies(scenario_id, expected_count=2, timeout=1)
+        assert replies == []
 
     def test_scenario_isolation(self):
-        s1 = f"iso-s1-{uuid.uuid4().hex[:8]}"
-        s2 = f"iso-s2-{uuid.uuid4().hex[:8]}"
-        task_repo = TaskRepository()
+        s1 = f"iso1-{uuid.uuid4().hex[:8]}"
+        s2 = f"iso2-{uuid.uuid4().hex[:8]}"
+        _write_reply(s1, "t1", True, {"output": "s1"})
+        _write_reply(s2, "t2", True, {"output": "s2"})
 
-        t1_id = f"t1-{uuid.uuid4().hex[:8]}"
-        t2_id = f"t2-{uuid.uuid4().hex[:8]}"
-
-        for sid, tid in [(s1, t1_id), (s2, t2_id)]:
-            task_repo.create(Task(
-                task_id=tid,
-                goal=f"task in {sid}",
-                state=TaskState.PENDING.value,
-                scenario_id=sid,
-                context=json.dumps({"command": f"echo {sid}"}),
-                created_at=datetime.now(),
-                updated_at=datetime.now(),
-            ))
-
-        mqs.dispatch_subtasks(s1, [
-            TaskMessage(task_id=t1_id, parent_task_id="", goal="s1 task",
-                        context={"command": f"echo {s1}"}),
-        ])
-        mqs.dispatch_subtasks(s2, [
-            TaskMessage(task_id=t2_id, parent_task_id="", goal="s2 task",
-                        context={"command": f"echo {s2}"}),
-        ])
-
-        r1 = mqs.collect_replies(s1, 1, timeout=10)
-        r2 = mqs.collect_replies(s2, 1, timeout=10)
-
-        assert len(r1) == 1 and r1[0].task_id == t1_id
-        assert len(r2) == 1 and r2[0].task_id == t2_id
-
-        mqs.stop_worker(s1)
-        mqs.stop_worker(s2)
-
-    def test_has_scenario(self):
-        scenario_id = f"has-{uuid.uuid4().hex[:8]}"
-        assert not mqs.has_scenario(scenario_id)
-
-        task_repo = TaskRepository()
-        task_id = f"t-{uuid.uuid4().hex[:8]}"
-        task_repo.create(Task(
-            task_id=task_id,
-            goal="test",
-            state=TaskState.PENDING.value,
-            scenario_id=scenario_id,
-            context=json.dumps({"command": "echo ok"}),
-            created_at=datetime.now(),
-            updated_at=datetime.now(),
-        ))
-
-        mqs.dispatch_subtasks(scenario_id, [
-            TaskMessage(task_id=task_id, parent_task_id="", goal="test",
-                        context={"command": "echo ok"}),
-        ])
-
-        assert mqs.has_scenario(scenario_id)
-        mqs.stop_worker(scenario_id)
+        r1 = mqs.collect_replies(s1, 1, timeout=5)
+        r2 = mqs.collect_replies(s2, 1, timeout=5)
+        assert len(r1) == 1 and r1[0].task_id == "t1"
+        assert len(r2) == 1 and r2[0].task_id == "t2"

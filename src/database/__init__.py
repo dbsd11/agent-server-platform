@@ -11,6 +11,7 @@ from .models.scenario import Scenario
 from .models.event import Event
 from .models.message import Message
 from .models.consumer_offset import ConsumerOffset
+from .models.execution_server import ExecutionServer
 
 from .repositories.base_repository import BaseRepository
 
@@ -29,6 +30,7 @@ def init_database():
             Event,
             Message,
             ConsumerOffset,
+            ExecutionServer,
         ]
 
         for model_class in models:

@@ -23,6 +23,7 @@ class TaskRepository(BaseRepository[Task]):
         cols_to_add = {
             "topic_id": "TEXT",
             "idempotency_key": "TEXT",
+            "depends_on": "TEXT",
             "agent_name": "TEXT",
             "agent_role": "TEXT",
             "execution_duration": "REAL",

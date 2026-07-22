@@ -216,13 +216,19 @@ class TestScenarioStateMachine:
         assert sm.can_transition(ScenarioState.CANCELLED)
 
     @pytest.mark.parametrize("terminal", [
-        ScenarioState.COMPLETED, ScenarioState.FAILED, ScenarioState.CANCELLED,
+        ScenarioState.COMPLETED, ScenarioState.FAILED,
     ])
     def test_terminal_states_have_no_transitions(self, terminal):
         sm = self._fresh_sm()
         sm.initialize(terminal)
         for state in ScenarioState:
             assert not sm.can_transition(state)
+
+    def test_cancelled_can_restart_to_running(self):
+        # A stopped (cancelled) scenario can be re-started from its config.
+        sm = self._fresh_sm()
+        sm.initialize(ScenarioState.CANCELLED)
+        assert sm.can_transition(ScenarioState.RUNNING)
 
     def test_full_lifecycle(self):
         sm = self._fresh_sm()

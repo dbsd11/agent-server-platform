@@ -2,6 +2,7 @@
 from queue import Queue
 from typing import Dict, Any, Callable, List, Optional
 from datetime import datetime
+import os
 import threading
 import json
 import uuid
@@ -55,16 +56,19 @@ class EventBus:
             "timestamp": datetime.now().isoformat(),
         }
 
-        # Persist to DB
-        try:
-            self.event_repo.create_event(
-                event_type,
-                json.dumps(data, ensure_ascii=False),
-                trace_id=trace_id,
-                metadata=json.dumps(metadata or {}, ensure_ascii=False),
-            )
-        except Exception as e:
-            logger.error(f"Failed to persist event: {e}")
+        # Persist to DB (skipped when EVENT_PERSIST_DISABLED is set — e.g. the
+        # standalone execution-agent-server, which has no backend DB access and
+        # reports events over WebSocket instead).
+        if not os.getenv("EVENT_PERSIST_DISABLED"):
+            try:
+                self.event_repo.create_event(
+                    event_type,
+                    json.dumps(data, ensure_ascii=False),
+                    trace_id=trace_id,
+                    metadata=json.dumps(metadata or {}, ensure_ascii=False),
+                )
+            except Exception as e:
+                logger.error(f"Failed to persist event: {e}")
 
         # Queue for processing
         try:

@@ -88,21 +88,48 @@ def start_flask(port: int, host: str):
     app.run(host=host, port=port, debug=False)
 
 
+def start_ws_server(port: int, host: str):
+    """Start the WebSocket server + CentralDispatcher process.
+
+    Accepts inbound connections from execution-agent-servers and routes
+    dispatched tasks to them (or runs them locally if no server is selected).
+    """
+    # init_database is idempotent; needed here so the execution_servers table
+    # exists and ConnectionManager initializes in this process.
+    init_database()
+
+    from database.repositories.execution_server_repository import ExecutionServerRepository
+    from core.ws_server import WSDispatcher
+    from core.central_dispatcher import central_dispatcher
+
+    # Clear stale connected=True rows from a previous backend run.
+    ExecutionServerRepository().mark_all_offline()
+
+    ws = WSDispatcher(host, port)
+    central_dispatcher.set_ws_dispatcher(ws)
+    central_dispatcher.start()
+
+    logger.info(f"Starting WS server on {host}:{port}")
+    ws.run()  # blocks (runs the asyncio loop forever)
+
+
 def main():
     """Main entry point"""
     # Parse arguments
     parser = argparse.ArgumentParser(description="Agent Server Platform")
     parser.add_argument("--gradio-only", action="store_true", help="Start only Gradio server")
     parser.add_argument("--flask-only", action="store_true", help="Start only Flask server")
-    parser.add_argument("--all", action="store_true", help="Start both Gradio and Flask servers")
+    parser.add_argument("--ws-only", action="store_true", help="Start only the WS server + CentralDispatcher")
+    parser.add_argument("--all", action="store_true", help="Start Gradio, Flask, and WS servers")
     parser.add_argument("--gradio-port", type=int, default=int(os.getenv("GRADIO_PORT", 8080)))
     parser.add_argument("--flask-port", type=int, default=int(os.getenv("FLASK_PORT", 5000)))
+    parser.add_argument("--ws-port", type=int, default=int(os.getenv("WS_PORT", 8765)))
     parser.add_argument("--host", type=str, default=os.getenv("HOST", "0.0.0.0"))
 
     args = parser.parse_args()
 
     # Default to --all if no option specified
-    if not (args.gradio_only or args.flask_only or args.all):
+    if not (args.gradio_only or args.flask_only or args.ws_only or args.all):
         args.all = True
 
     # Initialize database
@@ -122,8 +149,10 @@ def main():
             start_gradio(args.gradio_port, args.host)
         elif args.flask_only:
             start_flask(args.flask_port, args.host)
+        elif args.ws_only:
+            start_ws_server(args.ws_port, args.host)
         elif args.all:
-            # Start both servers in separate processes
+            # Start all servers in separate processes
             gradio_proc = multiprocessing.Process(
                 target=start_gradio,
                 args=(args.gradio_port, args.host)
@@ -132,16 +161,23 @@ def main():
                 target=start_flask,
                 args=(args.flask_port, args.host)
             )
+            ws_proc = multiprocessing.Process(
+                target=start_ws_server,
+                args=(args.ws_port, args.host)
+            )
 
             gradio_proc.start()
             flask_proc.start()
+            ws_proc.start()
 
             logger.info(f"Gradio server: http://{args.host}:{args.gradio_port}")
             logger.info(f"Flask API server: http://{args.host}:{args.flask_port}")
+            logger.info(f"WS server: ws://{args.host}:{args.ws_port}")
 
             # Wait for processes
             gradio_proc.join()
             flask_proc.join()
+            ws_proc.join()
 
     except KeyboardInterrupt:
         logger.info("Shutting down...")

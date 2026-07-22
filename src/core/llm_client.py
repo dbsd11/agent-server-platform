@@ -90,6 +90,19 @@ class LLMClient:
             return None
 
         # 构造提示词
+        # If the scenario configured execution-agent roles, constrain the LLM
+        # to pick role names from that list so tasks associate + route correctly.
+        role_names = context.get("execution_role_names") or []
+        if role_names:
+            names_str = "、".join(role_names)
+            role_constraint = (
+                f"5. **每个子任务的 context.role 必须从以下已配置的角色名称中选择，"
+                f"不得自创名称**：{names_str}\n"
+                f"   若目标只需单一角色，所有子任务的 role 都设为其中合适的一个。"
+            )
+        else:
+            role_constraint = ""
+
         prompt = f"""你是一个任务分解专家。请将以下目标分解为多个子任务，每个子任务由一个专门角色的智能代理来完成。
 
 目标：{goal}
@@ -106,22 +119,29 @@ class LLMClient:
    - "system_prompt": 系统提示词，定义该角色的能力和行为
    - "question": 该角色需要回答的具体问题或任务
 4. 子任务之间应该有清晰的逻辑关系
+5. **每个子任务必须有一个唯一的 id（如 "t1"、"t2"）和 depends_on 数组**：
+   - "id": 本子任务的唯一标识（字符串）
+   - "depends_on": 依赖的前序子任务 id 列表（数组）；无依赖用空数组 []
+   - depends_on 只能引用同批次其他子任务的 id，必须构成**无环 DAG**（不得循环依赖，不得依赖自己）
+   - 若子任务 B 需要子任务 A 的结果才能执行，则 B 的 depends_on 包含 "A 的 id"
+   - 无依赖关系的子任务用空数组，它们会并行执行
+{role_constraint}
 
 示例：
-如果目标是"计算 1+1"，应该分解为：
-- 子任务1: "计算数学表达式的结果"
+如果目标是"编写代码计算1+1并执行它"，应该分解为：
+- 子任务1: "编写计算1+1的Python代码"
+  id: "t1", depends_on: []
   context: {{
-    "role": "数学家",
-    "system_prompt": "你是一个专业的数学家，擅长各种数学计算和证明。请给出准确、简洁的答案。",
-    "question": "请计算 1+1 的结果"
+    "role": "代码执行专家",
+    "system_prompt": "...",
+    "question": "编写计算1+1的Python代码"
   }}
-
-如果目标是"分析销售数据并生成报告"，应该分解为：
-- 子任务1: "分析销售数据趋势"
+- 子任务2: "执行上述代码并给出结果"
+  id: "t2", depends_on: ["t1"]
   context: {{
-    "role": "数据分析师",
-    "system_prompt": "你是一个资深数据分析师，擅长从数据中发现趋势和洞察。请用数据说话，给出专业分析。",
-    "question": "分析以下销售数据的趋势和关键洞察..."
+    "role": "代码执行专家",
+    "system_prompt": "...",
+    "question": "执行上一步生成的代码并输出结果"
   }}
 
 返回格式（严格遵循）：
@@ -129,10 +149,12 @@ class LLMClient:
 {{
   "subtasks": [
     {{
+      "id": "t1",
       "goal": "子任务描述",
       "type": "execution",
       "priority": 0,
       "timeout_seconds": 3600,
+      "depends_on": [],
       "context": {{
         "role": "角色名称",
         "system_prompt": "系统提示词",
@@ -172,16 +194,40 @@ class LLMClient:
 
             # 验证和补充字段
             validated_subtasks = []
-            for task in subtasks:
-                if "goal" in task:
-                    validated_task = {
-                        "goal": task["goal"],
-                        "type": task.get("type", "execution"),
-                        "priority": task.get("priority", context.get("priority", 0)),
-                        "timeout_seconds": task.get("timeout_seconds", context.get("timeout_seconds", 3600)),
-                        "context": task.get("context", {})
-                    }
-                    validated_subtasks.append(validated_task)
+            # First pass: assign ids and collect the set of valid ids.
+            valid_ids = set()
+            for idx, task in enumerate(subtasks):
+                if "goal" not in task:
+                    continue
+                tid = task.get("id") or f"t{idx + 1}"
+                # de-duplicate ids
+                if tid in valid_ids:
+                    tid = f"t{idx + 1}"
+                valid_ids.add(tid)
+
+            for idx, task in enumerate(subtasks):
+                if "goal" not in task:
+                    continue
+                tid = task.get("id") or f"t{idx + 1}"
+                if tid not in valid_ids:
+                    tid = f"t{idx + 1}"
+                    valid_ids.add(tid)
+                # Sanitize depends_on: drop unknown refs + self-refs.
+                raw_deps = task.get("depends_on") or []
+                if not isinstance(raw_deps, list):
+                    raw_deps = []
+                deps = [d for d in raw_deps
+                        if d in valid_ids and d != tid]
+                validated_task = {
+                    "id": tid,
+                    "goal": task["goal"],
+                    "type": task.get("type", "execution"),
+                    "priority": task.get("priority", context.get("priority", 0)),
+                    "timeout_seconds": task.get("timeout_seconds", context.get("timeout_seconds", 3600)),
+                    "depends_on": deps,
+                    "context": task.get("context", {})
+                }
+                validated_subtasks.append(validated_task)
 
             if validated_subtasks:
                 logger.info(f"LLM decomposed goal into {len(validated_subtasks)} subtasks in {elapsed_time:.2f}s")

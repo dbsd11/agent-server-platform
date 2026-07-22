@@ -174,14 +174,10 @@ class ScenarioManager:
         3. Cleanup agent runs (call agent.cleanup + remove from registry)
         """
         from agents.agent_manager import agent_manager
-        from core.message_queue import mqs
         from database.repositories.task_repository import TaskRepository
         from database.repositories.consumer_offset_repository import ConsumerOffsetRepository
 
-        # 1. Stop execution worker
-        mqs.stop_worker(scenario_id)
-
-        # 2. Clean consumer offsets for this scenario
+        # 1. Clean consumer offsets for this scenario
         try:
             offset_repo = ConsumerOffsetRepository()
             for prefix in ("execution_worker", "scheduling_agent"):

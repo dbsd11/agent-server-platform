@@ -11,6 +11,9 @@ pymysql>=1.1.0
 # Async
 asyncio
 
+# WebSocket (backend <-> execution-agent-server)
+websockets>=12.0
+
 # Logging
 colorlog>=6.8.0
 

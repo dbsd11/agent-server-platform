@@ -148,6 +148,19 @@ class AgentManager:
             context["task_id"] = agent_run.task_id
             context["scenario_id"] = task.scenario_id
 
+            # Inject agent_roles from the scenario config so the SchedulingAgent
+            # can resolve per-role execution-server routing (server_id).
+            if "agent_roles" not in context and task.scenario_id:
+                try:
+                    from database.repositories.scenario_repository import ScenarioRepository
+                    scenario = ScenarioRepository().find_by_scenario_id(task.scenario_id)
+                    if scenario and scenario.config:
+                        scenario_config = json.loads(scenario.config)
+                        context["agent_roles"] = scenario_config.get("agent_roles", {})
+                except Exception as e:
+                    logger.warning(f"Could not load agent_roles for scenario "
+                                   f"{task.scenario_id}: {e}")
+
             # Run agent in thread pool to avoid blocking event loop
             # (SchedulingAgent may block on reply_queue.get())
             loop = asyncio.get_event_loop()

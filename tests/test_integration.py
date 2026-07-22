@@ -53,8 +53,14 @@ class TestSchedulingAgentIntegration:
             assert sub.idempotency_key is not None
 
     def test_run_with_scenario_dispatches_via_mqs(self, task_repo):
-        """When scenario_id is provided, subtasks are dispatched to MQS."""
+        """When scenario_id is provided, subtasks are dispatched to the MQ.
+
+        The CentralDispatcher (which consumes + executes) isn't running in unit
+        tests, so we verify dispatch rows were written and collect_replies
+        returns promptly with a short timeout.
+        """
         from core.message_queue import mqs
+        from database.repositories.message_repository import MessageRepository
 
         scenario_id = f"int-scenario-{uuid.uuid4().hex[:8]}"
 
@@ -63,19 +69,20 @@ class TestSchedulingAgentIntegration:
 
         parent_id = agent.create_task("Echo hello and echo world")
 
-        # Create tasks in DB for the worker to find
-        # (The MQS worker needs them in DB for mark_as_started/completed)
-
         result = agent.run(parent_id, {
             "goal": "Echo hello and echo world",
             "scenario_id": scenario_id,
+            "timeout_seconds": 2,  # short collect timeout (no consumer running)
         })
 
         assert result["success"] is True
         assert result["subtask_count"] == 2
         assert "replies" in result
 
-        mqs.stop_worker(scenario_id)
+        # Dispatch rows were written for both subtasks
+        rows = MessageRepository().find_by_scenario_id(scenario_id, limit=50)
+        dispatch_rows = [r for r in rows if r.message_type == "dispatch"]
+        assert len(dispatch_rows) == 2
 
 
 class TestExecutionAgentIntegration:

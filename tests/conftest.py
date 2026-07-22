@@ -73,13 +73,12 @@ def _reset_state_machines():
 
 
 def _stop_mqs_workers():
-    """Stop all MQS workers."""
-    try:
-        from core.message_queue import mqs
-        for sid in list(mqs._workers.keys()):
-            mqs.stop_worker(sid)
-    except Exception:
-        pass
+    """No-op: the per-scenario in-process ExecutionWorker was removed.
+
+    Dispatched tasks are now consumed by the CentralDispatcher (WS-server
+    process), which isn't started in unit tests.
+    """
+    pass
 
 
 # ── Fixtures ────────────────────────────────────────────────────────────────

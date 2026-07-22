@@ -77,5 +77,6 @@ SCENARIO_STATE_MACHINE = StateMachine({
     ScenarioState.RUNNING: {ScenarioState.COMPLETED, ScenarioState.FAILED, ScenarioState.CANCELLED},
     ScenarioState.COMPLETED: set(),  # Terminal state
     ScenarioState.FAILED: set(),     # Terminal state
-    ScenarioState.CANCELLED: set(),  # Terminal state
+    # A stopped scenario can be restarted (re-run from its config).
+    ScenarioState.CANCELLED: {ScenarioState.RUNNING},
 })
