@@ -3,6 +3,7 @@ import gradio as gr
 from datetime import datetime
 
 from database.repositories.task_repository import TaskRepository
+from database.repositories.scenario_repository import ScenarioRepository
 
 
 def create_page(global_state_component):
@@ -24,7 +25,7 @@ def create_page(global_state_component):
                     refresh_btn = gr.Button("Refresh", variant="secondary")
 
             task_list = gr.Dataframe(
-                headers=["Task ID", "Goal", "State", "Agent Name", "Agent Role", "Duration (s)", "Priority", "Retry Count", "Created At"],
+                headers=["Task ID", "Scenario ID", "Scenario Name", "Goal", "State", "Agent Name", "Agent Role", "Duration (s)", "Priority", "Retry Count", "Created At"],
                 label="Tasks",
                 wrap=True
             )
@@ -54,6 +55,13 @@ def create_page(global_state_component):
             else:
                 tasks = task_repo.find_by_state(state_filter)
 
+            # Resolve scenario names in one pass (one query, not N)
+            scenario_names = {}
+            scenario_ids = {t.scenario_id for t in tasks if t.scenario_id}
+            if scenario_ids:
+                for s in ScenarioRepository().find_all(limit=500):
+                    scenario_names[s.scenario_id] = s.name
+
             rows = []
             for t in tasks:
                 # Format execution duration
@@ -61,8 +69,11 @@ def create_page(global_state_component):
                 if t.execution_duration is not None:
                     duration_display = f"{t.execution_duration:.2f}"
 
+                sid = t.scenario_id or ""
                 rows.append([
                     t.task_id,
+                    sid[:12] + "..." if len(sid) > 12 else (sid or "—"),
+                    scenario_names.get(sid, "—"),
                     t.goal[:50] if t.goal else "",
                     t.state,
                     t.agent_name or "—",

@@ -1,8 +1,18 @@
 # Agent Server Platform
 
-A universal agent-server platform built on Gradio + Flask, implementing a two-tier architecture for multi-agent orchestration: scenario-based collaboration, task scheduling with **dependency-aware serial/parallel execution**, a **decoupled execution-agent server connected over WebSocket**, sandboxed execution, agent-to-agent (A2A) messaging, and fault-tolerant watchdog recovery.
+A universal agent-server platform built on Gradio + Flask, implementing a two-tier architecture for multi-agent orchestration: scenario-based collaboration, task scheduling with **dependency-aware serial/parallel execution**, a **decoupled execution-agent server connected over WebSocket**, an **AI chatbot assistant for conversational scenario management** (view/summarize + create-with-preview-then-confirm), **ack-after-execute delivery with crash recovery**, sandboxed execution, agent-to-agent (A2A) messaging, and fault-tolerant watchdog recovery.
 
 ## Features
+
+### AI Scenario-Management Chatbot
+
+The Home page hosts a conversational assistant (floating button → modal) for managing scenarios in natural language:
+
+- **Manage scenarios**: list/view in-progress scenarios and ask for AI summaries of an agent conversation history (reuses the unified message-timeline builder).
+- **Create scenarios via multi-turn dialogue**: the assistant assembles a scene-spec draft as you refine it. A live **preview** is shown; the **Confirm save** button only appears when there are unsaved changes. Nothing is written to the DB until you confirm.
+- **Modify existing scenarios**: edit any `initializing`-state scenario — the assistant loads its **full current config** first (so no fields are lost), updates on confirm are routed through `update_scenario` (including `scenario_type`), and non-initializing scenarios are rejected with a clear message.
+- **Clear / discard**: clear the conversation or discard a draft at any time.
+- Scenario types are constrained to `simple_qa` and `code_execution`.
 
 ### Two-Tier Architecture
 
@@ -17,6 +27,14 @@ Execution is split out of the backend into an **independently-deployable executi
 - Each exec-server reports **status** (`offline` / `idle` / `running`, total quota + current running count), **environment info** (probes `bash, sh, python, claude, codex, qwen, curl, wget, ls, mkdir, cat, sed` + host `hostname` / `IP` / `OS`), and **task execution events** (`execution_agent_created`, `task_started`, `task_result`) over WS.
 - In **scenario/mode creation**, each execution-agent role gets a dropdown to bind it to a specific exec-server. Tasks for that role route to the selected server; **if no server is selected, execution falls back to the backend (local)**, preserving the original behavior.
 - Disconnect handling: an in-flight task is **deferred and re-dispatched on reconnect** (bounded by the watchdog timeout) — no silent loss.
+
+### Reliable Delivery & Crash Recovery
+
+The dispatch queue uses **ack-after-execute** semantics so a backend crash mid-execution never silently loses a task:
+
+- A dispatch row carries an `acked` flag (`messages.acked`); the global consumer reads unacked rows and **acks only after the task reaches a terminal state** (local path: after `run_task_locally` returns; WS path: after `forward_task` finalizes).
+- An in-process **in-flight guard** prevents the same `task_id` from being dispatched twice before it completes; **idempotency checks** skip redelivery of already-terminal tasks.
+- On a **platform restart**, `recover_orphans_on_startup()` marks any `running` scenario and any `pending`/`running`/`waiting` task as `failed` — their execution threads died with the process, so this surfaces them as visible failures instead of leaving them `running` forever. (Full scenario *resume* from a checkpoint is future work.)
 
 ### Dependency-Aware Scheduling (Serial / Parallel)
 
@@ -36,8 +54,8 @@ The SchedulingAgent decomposes a goal into subtasks that form a **DAG** (the LLM
 | Watchdog | `core/watchdog.py` | Timeout detection and recovery |
 | Sandbox | `core/sandbox.py` | Subprocess-isolated task execution (evolves to Docker/K8s) |
 | A2A Protocol | `core/a2a_protocol.py` | Queue-based agent-to-agent messaging |
-| Message Queue | `core/message_queue.py` | DB-backed transport with per-consumer offsets |
-| Central Dispatcher | `core/central_dispatcher.py` | Global consumer routing dispatch rows to exec-servers (WS) or local |
+| Message Queue | `core/message_queue.py` | DB-backed transport with per-consumer offsets (dispatch ack-after-execute) |
+| Central Dispatcher | `core/central_dispatcher.py` | Global consumer routing dispatch rows to exec-servers (WS) or local; ack-after-execute + in-flight guard |
 | WS Server | `core/ws_server.py` | Backend WebSocket server + exec-server registry + reply correlation |
 | WS Protocol | `core/ws_protocol.py` | Frame envelope for backend ↔ exec-server communication |
 | LLM Client | `core/llm_client.py` | DashScope (OpenAI-compatible) wrapper; dependency-aware decomposition |
@@ -48,7 +66,10 @@ The SchedulingAgent decomposes a goal into subtasks that form a **DAG** (the LLM
 
 ### User Interface
 
-- **Gradio Web UI** (7 pages): Home, Scenario Dashboard, Task Monitor, Agent Registry, **Execution Servers**, Event Log, User.
+- **Gradio Web UI** (7 pages): Home (metrics + scenario-management chatbot), Scenario Dashboard, Task Monitor, Agent Registry, **Execution Servers**, Event Log, User.
+  - **Home**: a slim metrics row plus a floating chatbot assistant for viewing/summarizing scenarios and creating/modifying them via multi-turn dialogue with a preview-then-confirm flow.
+  - **Task Monitor**: shows each task's **scenario ID + scenario name** alongside state/agent/duration.
+  - **Agent Registry**: materializes the scenario's declared agent topology (scheduling + execution roles, with role config) at scenario start; rows are scoped to the scenario lifecycle.
 - **Flask REST API**: Task, Scenario, Event endpoints with Swagger docs (`flask-restx`).
 
 ### Database
@@ -158,6 +179,7 @@ agent-server-platform/
 │   ├── api/                        # Flask REST API (flask-restx)
 │   │   └── route/                  # task / scenario / event namespaces
 │   ├── pages/                      # Gradio UI pages (7)
+│   │   └── home/assistant.py       # Scenario-management chatbot brain (LLM + draft/preview/confirm)
 │   ├── route/router.py             # Gradio multi-page router
 │   ├── database/                   # Connection manager, models, repositories
 │   ├── auth/                       # Authentication
@@ -253,6 +275,8 @@ ScenarioManager ─► SchedulingAgent.run ─► _decompose_goal (LLM, DAG w/ i
         │   │   server_id set + connected → WSDispatcher.forward_task ──WS──► exec-server
         │   │   server_id set + offline    → defer, drain on reconnect       │
         │   │   no server_id               → run_task_locally (legacy path)  │
+        │   │   ack-after-execute: dispatch row acked only on task terminal  │
+        │   │   startup: recover_orphans_on_startup marks in-flight failed   │
         │   └───────────────────────────────┬───────────────────────────────┘
         │                                   │
         │   reply rows (same shape) → mqs.collect_replies (per wave) → next wave
@@ -261,9 +285,10 @@ ScenarioManager ─► SchedulingAgent.run ─► _decompose_goal (LLM, DAG w/ i
 ### Event Types
 
 - **Task**: `task.created`, `task.state_changed`, `task.execution_started/completed/failed`, `task.scheduled`, `task.skipped`, `task.execution_agent_created`
-- **Scenario**: `scenario.created`, `scenario.state_changed`, `scenario.completed/failed`
+- **Scenario**: `scenario.created`, `scenario.state_changed`, `scenario.updated`, `scenario.completed/failed`
 - **Agent**: `agent.registered`, `agent.started`, `agent.stopped`
 - **Watchdog**: `watchdog.timeout_detected`, `watchdog.recovery_attempted`
+- **Recovery**: `recovery.orphans_marked` (startup sweep of in-flight scenarios/tasks)
 
 ## Evolution Path
 
@@ -300,13 +325,21 @@ ScenarioManager ─► SchedulingAgent.run ─► _decompose_goal (LLM, DAG w/ i
 - **Dependency-aware scheduling**: LLM emits `id` + `depends_on`; wave-based serial/parallel execution with upstream-result injection and failure propagation.
 - `cancelled → running` scenario restart; execution tasks now record agent name/role/duration.
 
-### Phase 5 — Production (Next)
+### Phase 5 — Chatbot Assistant & Delivery Reliability ✅
+
+- **AI scenario-management chatbot** on the Home page: conversational view/summarize + create-with-preview-then-confirm + modify existing (`initializing`-only) scenarios; draft preview and confirm buttons gated on unsaved changes.
+- **Ack-after-execute** dispatch semantics (`messages.acked`) + in-flight guard + idempotent redelivery.
+- **Startup orphan recovery**: in-flight scenarios/tasks orphaned by a restart are marked `failed` (no permanent `running`).
+- Home page slim metrics retained alongside the chatbot; Task Monitor shows scenario ID + name; Agent Registry materializes declared agent topology.
+
+### Phase 6 — Production (Next)
 
 - ⏳ MySQL/PostgreSQL migration
 - ⏳ Docker / Kubernetes sandbox
 - ⏳ Redis event bus + message queue
 - ⏳ Authentication hardening
 - ⏳ Production deployment
+- ⏳ Scenario resume from checkpoint (beyond mark-as-failed)
 
 ## Documentation
 
@@ -326,6 +359,6 @@ For questions or issues, contact the Agent Server Platform Team.
 
 ---
 
-**Version**: 2.1.0
-**Last Updated**: 2026/07/22
-**Status**: Phase 4 Complete — Decoupled Execution Server + Dependency Scheduling
+**Version**: 2.2.0
+**Last Updated**: 2026/07/23
+**Status**: Phase 5 Complete — Scenario-Management Chatbot + Reliable Delivery & Crash Recovery

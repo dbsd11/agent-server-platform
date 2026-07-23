@@ -23,7 +23,7 @@ from core.ws_protocol import (
     STATUS_IDLE, STATUS_OFFLINE,
 )
 from core.message_queue import TaskMessage
-from core.central_dispatcher import finalize_task
+from core.central_dispatcher import finalize_task, central_dispatcher
 from core.event_bus import event_bus
 from database.repositories.execution_server_repository import ExecutionServerRepository
 from database.repositories.task_repository import TaskRepository
@@ -46,7 +46,7 @@ class WSDispatcher:
         self.pending: Dict[str, Any] = {}
         # task_id -> server_id (so disconnect can fail the right futures)
         self.task_server: Dict[str, str] = {}
-        # server_id -> list[(scenario_id, TaskMessage)] parked until reconnect
+        # server_id -> list[(scenario_id, TaskMessage, dispatch_id)] parked until reconnect
         self.deferred: Dict[str, list] = {}
         self._lock = threading.Lock()
         self._server_repo = ExecutionServerRepository()
@@ -71,17 +71,20 @@ class WSDispatcher:
             return server_id in self.connections
 
     def schedule_forward(self, server_id: str, scenario_id: Optional[str],
-                         msg: TaskMessage) -> None:
+                         msg: TaskMessage, dispatch_id: Optional[int] = None) -> None:
         """Schedule a forward on the WS loop (fire-and-forget)."""
         asyncio.run_coroutine_threadsafe(
-            self.forward_task(server_id, scenario_id, msg), self.loop
+            self.forward_task(server_id, scenario_id, msg, dispatch_id), self.loop
         )
 
     def defer(self, server_id: str, scenario_id: Optional[str],
-              msg: TaskMessage) -> None:
-        """Park a task until the server reconnects."""
+              msg: TaskMessage, dispatch_id: Optional[int] = None) -> None:
+        """Park a task until the server reconnects. Does NOT ack the dispatch
+        (the task isn't done); stays in-flight so the consumer won't redeliver
+        within this process. Re-forwarded on reconnect, then acked on finalize.
+        """
         with self._lock:
-            self.deferred.setdefault(server_id, []).append((scenario_id, msg))
+            self.deferred.setdefault(server_id, []).append((scenario_id, msg, dispatch_id))
             n = len(self.deferred[server_id])
         logger.info(f"Deferred task {msg.task_id} for server {server_id} "
                     f"(parked={n})")
@@ -89,13 +92,24 @@ class WSDispatcher:
     # --- forward + reply correlation (runs on the WS loop) ------------------
 
     async def forward_task(self, server_id: str, scenario_id: Optional[str],
-                           msg: TaskMessage) -> None:
+                           msg: TaskMessage,
+                           dispatch_id: Optional[int] = None) -> None:
         """Send a task to a server and await its result.
 
         Owns the full WS-path lifecycle: mark started -> send -> await result ->
-        finalize. On any connection failure, defer for re-dispatch on reconnect.
+        finalize -> ack. On any connection failure, defer (no ack) for
+        re-dispatch on reconnect.
         """
         task_repo = TaskRepository()
+
+        # Idempotency: redelivery of an already-terminal task -> ack + skip.
+        existing = task_repo.find_by_task_id(msg.task_id)
+        if existing and existing.state in {"success", "failed", "timeout", "cancelled"}:
+            logger.info(f"forward_task: task {msg.task_id} already terminal "
+                        f"({existing.state}); skipping redelivery")
+            central_dispatcher._ack(dispatch_id, msg.task_id)
+            return
+
         future = self.loop.create_future()
         with self._lock:
             self.pending[msg.task_id] = future
@@ -107,7 +121,7 @@ class WSDispatcher:
             with self._lock:
                 self.pending.pop(msg.task_id, None)
                 self.task_server.pop(msg.task_id, None)
-            self.defer(server_id, scenario_id, msg)
+            self.defer(server_id, scenario_id, msg, dispatch_id)
             return
 
         try:
@@ -124,7 +138,7 @@ class WSDispatcher:
             with self._lock:
                 self.pending.pop(msg.task_id, None)
                 self.task_server.pop(msg.task_id, None)
-            self.defer(server_id, scenario_id, msg)
+            self.defer(server_id, scenario_id, msg, dispatch_id)
             return
 
         with self._lock:
@@ -138,6 +152,8 @@ class WSDispatcher:
                       agent_name=f"ExecutionServer:{server_id}",
                       agent_role=agent_role,
                       execution_duration=round(elapsed, 3))
+        # Ack the dispatch now that the task is finalized (ack-after-execute).
+        central_dispatcher._ack(dispatch_id, msg.task_id)
 
     # --- connection handler -------------------------------------------------
 
@@ -264,10 +280,10 @@ class WSDispatcher:
     def _drain_deferred(self, server_id: str) -> None:
         with self._lock:
             parked = self.deferred.pop(server_id, [])
-        for scenario_id, msg in parked:
+        for scenario_id, msg, dispatch_id in parked:
             logger.info(f"Re-dispatching deferred task {msg.task_id} "
                         f"to {server_id}")
-            self.schedule_forward(server_id, scenario_id, msg)
+            self.schedule_forward(server_id, scenario_id, msg, dispatch_id)
 
     # --- heartbeat sweeper --------------------------------------------------
 

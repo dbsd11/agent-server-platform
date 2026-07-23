@@ -136,6 +136,12 @@ def main():
     logger.info("Initializing database...")
     init_database()
 
+    # Reclaim orphans from a prior crash/restart: mark in-flight scenarios +
+    # tasks failed so nothing stays "running" forever (no live runner exists
+    # for them after a restart).
+    from scenarios.scenario_manager import recover_orphans_on_startup
+    recover_orphans_on_startup()
+
     # Register signal handlers
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)

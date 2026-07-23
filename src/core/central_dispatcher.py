@@ -4,23 +4,31 @@
 # each to either a connected execution-agent-server (via WSDispatcher) or to
 # local in-process execution. Reply rows are written in the same shape as the
 # old ExecutionWorker, so SchedulingAgent.collect_replies is unchanged.
+#
+# Delivery semantics: ack-after-execute. A dispatch row is acked (acked=1) only
+# after the task reaches a terminal state, so a crash mid-execution leaves it
+# unacked and it is redelivered on the next consumer poll (or after a restart).
+# An in-flight guard prevents the same task_id from being dispatched twice
+# within one process; idempotency checks skip already-terminal tasks on
+# redelivery. Startup orphan recovery (scenarios.scenario_manager) marks
+# in-flight tasks/scenarios failed on restart so nothing stays "running" forever.
 import os
 import json
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Set
 
 from logger import logger
 from core.message_queue import TaskMessage
 from database.repositories.message_repository import MessageRepository
-from database.repositories.consumer_offset_repository import ConsumerOffsetRepository
 from database.repositories.task_repository import TaskRepository
 from database.models.message import Message
 
 
-GLOBAL_CONSUMER_ID = "execution_worker:global"
+# Terminal task states — redelivery of a task in one of these is a no-op.
+_TERMINAL_TASK_STATES = {"success", "failed", "timeout", "cancelled"}
 
 
 def finalize_task(scenario_id: Optional[str], task_id: str, result: dict,
@@ -74,6 +82,15 @@ def run_task_locally(scenario_id: Optional[str], msg: TaskMessage) -> None:
     from core.agents.execution_agent import ExecutionAgent
 
     task_repo = TaskRepository()
+
+    # Idempotency: if a previous run already drove this task to a terminal
+    # state (e.g. redelivery after a crash), don't re-execute.
+    existing = task_repo.find_by_task_id(msg.task_id)
+    if existing and existing.state in _TERMINAL_TASK_STATES:
+        logger.info(f"[Local] Task {msg.task_id} already terminal "
+                    f"({existing.state}); skipping redelivery")
+        return
+
     start_time = time.time()
 
     agent = ExecutionAgent()
@@ -120,12 +137,15 @@ class CentralDispatcher:
         self.thread: Optional[threading.Thread] = None
         self.executor: Optional[ThreadPoolExecutor] = None
         self.ws = None  # WSDispatcher reference; set via set_ws_dispatcher()
+        # task_ids currently executing in this process — prevents the same
+        # unacked dispatch from being submitted twice before it completes.
+        self._in_flight: Set[str] = set()
+        self._in_flight_lock = threading.Lock()
 
     def set_ws_dispatcher(self, ws) -> None:
         self.ws = ws
 
     def start(self) -> None:
-        self._bootstrap_offset()
         self.executor = ThreadPoolExecutor(
             max_workers=self.max_workers,
             thread_name_prefix="central-exec",
@@ -134,26 +154,33 @@ class CentralDispatcher:
             target=self._run, daemon=True, name="central-dispatcher"
         )
         self.thread.start()
-        logger.info(f"CentralDispatcher started (local workers={self.max_workers}, "
-                    f"global consumer={GLOBAL_CONSUMER_ID})")
+        logger.info(f"CentralDispatcher started (local workers={self.max_workers})")
 
-    def _bootstrap_offset(self) -> None:
-        """First run: set the global offset to MAX(messages.id) so old dispatch
-        rows from prior runs are not replayed."""
-        offset_repo = ConsumerOffsetRepository()
-        existing = offset_repo.find_by_id(GLOBAL_CONSUMER_ID)
-        if existing:
-            return
-        max_id = MessageRepository().max_message_id()
-        offset_repo.update_offset(GLOBAL_CONSUMER_ID, max_id)
-        logger.info(f"Bootstrapped global dispatch offset to {max_id}")
+    def _ack(self, dispatch_id: Optional[int], task_id: str) -> None:
+        """Ack a dispatch message + release the in-flight slot.
+
+        Called by the local path after run_task_locally returns, and by the WS
+        path (forward_task) after finalize. Safe to call with dispatch_id=None
+        (legacy/defensive).
+        """
+        if dispatch_id is not None:
+            try:
+                MessageRepository().ack_message(dispatch_id)
+            except Exception as e:
+                logger.error(f"[Dispatcher] Failed to ack message {dispatch_id}: {e}")
+        with self._in_flight_lock:
+            self._in_flight.discard(task_id)
 
     def _run(self) -> None:
         msg_repo = MessageRepository()
-        offset_repo = ConsumerOffsetRepository()
 
         while not self._stop.is_set():
-            pending = msg_repo.find_pending_dispatch_global(GLOBAL_CONSUMER_ID, limit=10)
+            try:
+                pending = msg_repo.find_unacked_dispatch(limit=10)
+            except Exception as e:
+                logger.error(f"[Dispatcher] find_unacked_dispatch failed: {e}")
+                time.sleep(1)
+                continue
 
             if not pending:
                 time.sleep(0.5)
@@ -170,42 +197,60 @@ class CentralDispatcher:
                     )
                 except (json.JSONDecodeError, TypeError):
                     logger.error(f"Failed to parse dispatch message {rec.id}")
-                    offset_repo.update_offset(GLOBAL_CONSUMER_ID, rec.id)
+                    self._ack(rec.id, f"__bad_{rec.id}")
                     continue
 
-                # Advance offset before processing (at-least-once semantics)
-                offset_repo.update_offset(GLOBAL_CONSUMER_ID, rec.id)
+                task_id = task_msg.task_id
+                # In-flight guard: same task already executing here -> skip
+                # (its dispatch is still unacked; will be acked on completion).
+                with self._in_flight_lock:
+                    if task_id in self._in_flight:
+                        continue
+                    self._in_flight.add(task_id)
 
-                self.executor.submit(self._dispatch_one, rec.scenario_id, task_msg)
+                self.executor.submit(self._dispatch_one, rec.scenario_id, task_msg, rec.id)
 
         if self.executor:
             self.executor.shutdown(wait=True)
         logger.info("CentralDispatcher stopped")
 
-    def _dispatch_one(self, scenario_id: Optional[str], msg: TaskMessage) -> None:
+    def _dispatch_one(self, scenario_id: Optional[str], msg: TaskMessage,
+                      dispatch_id: Optional[int]) -> None:
         """Route one task: WS forward (if server selected + connected),
-        defer (server selected but offline), or local execution (no server)."""
+        defer (server selected but offline), or local execution (no server).
+
+        ack happens on completion (local: after run_task_locally returns;
+        WS: in forward_task after finalize). defer does NOT ack.
+        """
         server_id = msg.context.get("server_id")
 
         if not server_id:
             # No server selected -> current behavior: execute locally.
-            run_task_locally(scenario_id, msg)
+            try:
+                run_task_locally(scenario_id, msg)
+            finally:
+                self._ack(dispatch_id, msg.task_id)
             return
 
         if not self.ws:
             # WS subsystem not running -> safety fallback to local.
             logger.warning(f"[Dispatcher] No WS subsystem; task {msg.task_id} "
                            f"with server_id={server_id} runs locally")
-            run_task_locally(scenario_id, msg)
+            try:
+                run_task_locally(scenario_id, msg)
+            finally:
+                self._ack(dispatch_id, msg.task_id)
             return
 
         if self.ws.is_connected(server_id):
             # Fire-and-forget on the WS loop; forward_task owns the lifecycle
-            # (mark started -> send -> await -> finalize, or defer on drop).
-            self.ws.schedule_forward(server_id, scenario_id, msg)
+            # (mark started -> send -> await -> finalize -> ack, or defer on drop).
+            self.ws.schedule_forward(server_id, scenario_id, msg, dispatch_id)
         else:
-            # Server offline -> park until it reconnects.
-            self.ws.defer(server_id, scenario_id, msg)
+            # Server offline -> park until it reconnects. Stays unacked +
+            # in-flight so the consumer won't redeliver within this process;
+            # on reconnect _drain_deferred re-forwards, eventually acking.
+            self.ws.defer(server_id, scenario_id, msg, dispatch_id)
 
     def stop(self) -> None:
         self._stop.set()
@@ -217,3 +262,66 @@ class CentralDispatcher:
 
 # Global singleton (started by the WS-server process)
 central_dispatcher = CentralDispatcher()
+
+
+# ── self-check ─────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    # ponytail: one runnable check — in-flight guard + ack semantics, no DB.
+    import core.central_dispatcher as _self
+
+    acked_ids = []
+
+    class _StubMsgRepo:
+        def find_unacked_dispatch(self, limit=100):
+            return []
+        def ack_message(self, mid):
+            acked_ids.append(mid)
+
+    _real_repo = MessageRepository
+    globals()["MessageRepository"] = _StubMsgRepo
+    d = CentralDispatcher()
+    try:
+        # _ack acks the message + releases the in-flight slot
+        with d._in_flight_lock:
+            d._in_flight.add("t1")
+        d._ack(7, "t1")
+        assert acked_ids == [7], f"ack should record id 7: {acked_ids}"
+        assert "t1" not in d._in_flight, "ack should release in-flight slot"
+        # dispatch_id=None still releases the slot, no ack
+        with d._in_flight_lock:
+            d._in_flight.add("t2")
+        d._ack(None, "t2")
+        assert acked_ids == [7] and "t2" not in d._in_flight, "None id: no ack, slot released"
+
+        # idempotency: terminal task -> run_task_locally skips execution
+        from core.message_queue import TaskMessage
+        calls = {"run": 0}
+        class _FakeAgent:
+            def initialize(self, cfg): pass
+            def run(self, *a, **k): calls["run"] += 1; return {"success": True, "output": "x"}
+            def cleanup(self): pass
+        class _StubTaskRepo:
+            def __init__(self): self.state = "success"  # already terminal
+            def find_by_task_id(self, tid):
+                class T: state = self.state
+                return T()
+            def mark_as_started(self, tid): pass
+            def mark_as_completed(self, *a, **k): pass
+            def mark_as_failed(self, *a, **k): pass
+        _self_TaskRepository = TaskRepository
+        globals()["TaskRepository"] = _StubTaskRepo
+        # patch ExecutionAgent import inside run_task_locally
+        import core.agents.execution_agent as _ea
+        _orig_exec_cls = _ea.ExecutionAgent
+        _ea.ExecutionAgent = _FakeAgent
+        try:
+            run_task_locally("sc", TaskMessage(task_id="t9", parent_task_id="",
+                                               goal="g", context={}))
+            assert calls["run"] == 0, "terminal task must not re-execute"
+        finally:
+            _ea.ExecutionAgent = _orig_exec_cls
+            globals()["TaskRepository"] = _self_TaskRepository
+    finally:
+        globals()["MessageRepository"] = _real_repo
+
+    print("central_dispatcher self-check OK")

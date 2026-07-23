@@ -69,6 +69,7 @@ class MessageQueueService:
                         "context": msg.context,
                     }, ensure_ascii=False),
                     timestamp=datetime.now(),
+                    acked=0,
                 ))
             except Exception as e:
                 logger.error(f"Failed to persist dispatch message: {e}")

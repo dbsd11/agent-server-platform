@@ -8,7 +8,6 @@ from datetime import datetime
 
 from database.repositories.agent_repository import AgentRepository
 from database.repositories.task_repository import TaskRepository
-from database.models.agent import Agent
 from database.models.task import Task
 from core.agents.base_agent import BaseAgent, AgentRun
 from core.agents.scheduling_agent import SchedulingAgent
@@ -93,20 +92,11 @@ class AgentManager:
         agent = agent_cls()
         agent.initialize(context or {})
 
-        # Register agent in DB for watchdog recovery (scoped to scenario lifecycle)
-        if scenario_id:
-            agent_record = Agent(
-                agent_id=agent_run_id,
-                scenario_id=scenario_id,
-                agent_type=agent_type,
-                name=f"{agent_type}-{task_id[:8]}",
-                description="",
-                config=json.dumps(context or {}),
-                status="active",
-                created_at=datetime.now(),
-                updated_at=datetime.now(),
-            )
-            self.agent_repo.create(agent_record)
+        # Agent DB rows are now registered from the scenario's declared topology
+        # at scenario start (scenario_manager._register_declared_agents), not as
+        # a side-effect of task submission — the decoupled architecture runs
+        # execution agents on remote exec-servers, so per-task rows here would
+        # be incomplete (only scheduling, empty config) and misleading.
 
         agent_run = AgentRun(agent, task_id, context or {})
 
