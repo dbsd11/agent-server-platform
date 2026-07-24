@@ -62,6 +62,7 @@ The SchedulingAgent decomposes a goal into subtasks that form a **DAG** (the LLM
 | Agents | `core/agents/` | `BaseAgent`, `SchedulingAgent` (ReAct + wave scheduler), `ExecutionAgent` |
 | Agent Manager | `agents/agent_manager.py` | Agent lifecycle and registry |
 | Execution Server | `execution_server/` | Standalone WS client package (env probe, task runner, heartbeat) |
+| hiclaw Runtime | `hiclaw/` | Self-contained execution substrate (Worker/SOUL/CRD/object store/Room/skills/MCP) backing `ExecutionAgent`; see Phase 5.5 |
 | Scenarios | `scenarios/` | `BaseScenario`, `ScenarioManager`, flow definitions, components |
 
 ### User Interface
@@ -331,6 +332,17 @@ ScenarioManager ─► SchedulingAgent.run ─► _decompose_goal (LLM, DAG w/ i
 - **Ack-after-execute** dispatch semantics (`messages.acked`) + in-flight guard + idempotent redelivery.
 - **Startup orphan recovery**: in-flight scenarios/tasks orphaned by a restart are marked `failed` (no permanent `running`).
 - Home page slim metrics retained alongside the chatbot; Task Monitor shows scenario ID + name; Agent Registry materializes declared agent topology.
+
+### Phase 5.5 — hiclaw-Backed Execution Agent ✅
+
+`ExecutionAgent` is rebuilt as a thin facade over a self-contained `src/hiclaw/` execution substrate (mirrors the AgentTeams/hiclaw model). The orchestration layer (`SchedulingAgent`, scenario manager) is unchanged — only the execution leaf is hiclaw-backed, zero-invasive to callers.
+
+- **`HiclawWorker`** — each execution role materializes as a Worker: `WorkerSpec` (CRD) → `SOUL.md` persona (role + system_prompt) → shared `Room`. Execution follows the **RECEIVE → PROCESS → RESPOND** contract: writes `shared/tasks/<id>/spec.md` + `result.md` + `meta.json` to an object store, and posts start/complete notifications to its Room.
+- **`_process` 3-way dispatch** — `script`/`command` → shared `core.sandbox.Sandbox`; `mcp_tool` → `McpGateway` (dynamic grant/revoke, revoked → 403); otherwise LLM Q&A (DashScope) with a **deterministic offline fallback** when no LLM key or empty reply, so the execution chain stays verifiable offline.
+- **Object store / CRD / Room / Skills / MCP** — `LocalFileStore` (path-traversal-safe, swappable for MinIO/S3), `ResourceRegistry` persistence, in-process `RoomService` (Matrix abstraction, single timeline), `SKILL.md` frontmatter materialization, and `McpGateway` (Higress abstraction).
+- **Upstream-result aggregation (fix)** — dependent tasks (wave > 0) now receive predecessors' real output. The scheduler already injected `upstream_results`/`upstream_outputs` into the dependent's context; `HiclawWorker._compose_user_prompt` now folds them into the LLM user message (and the offline fallback), so wave-1 synthesis actually builds on wave-0 output instead of re-generating from a generic instruction. Verified by `test_worker_llm_consumes_upstream` / `test_worker_llm_no_upstream_unchanged`.
+
+The hiclaw package also ships a **standalone runtime** (`HiclawManager` + pure-function wave scheduler + `agt` CLI) for offline use without the platform; the backend path uses only `HiclawWorker`. See `docs/agentteams-hiclaw.md`.
 
 ### Phase 6 — Production (Next)
 

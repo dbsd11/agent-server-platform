@@ -238,3 +238,55 @@
 - 支持多轮反驳 + 裁判综合裁决。
 - 接线校验全通过 (preset 解析 / 初始化 / 覆盖 / 校验 / 输出抽取 / route import)。
 - 未做端到端 LLM 运行：环境未配置 DASHSCOPE_API_KEY；配好 key 后即可 `POST /api/scenario` 创建 `debate` 类型并 start。
+
+---
+
+## hiclaw 适配层（调度/执行 Agent 构造与执行）
+
+### ✅ Completed
+
+基于 `docs/agentteams-hiclaw.md` 落地自包含 Python 适配层 `src/hiclaw/`，离线可验证（无 Docker、无 LLM Key）。
+
+- [x] `object_store.py` — `ObjectStore` 抽象 + `LocalFileStore`（镜像 `agents/<name>/`、`shared/tasks/<id>/`、`manager/` 前缀，路径穿越防护），可替换为 MinIO/S3。
+- [x] `crd.py` — `WorkerSpec`/`ManagerSpec`/`TeamSpec`/`HumanSpec` + `ResourceRegistry`（持久化到 `_crd/<kind>/<name>.json`，对应 controller 调和）。
+- [x] `soul.py` — `Soul` + `SOUL.md` 渲染；Manager soul = 波调度契约（转译自 `scheduling_agent.py` 不变量）。
+- [x] `skills.py` + `skills_builtin/` — `SKILL.md` frontmatter 解析 + 物化进 workspace（task-coordination/file-sync/task-progress/mcporter）。
+- [x] `room.py` — in-process `Room`/`RoomService`（Matrix 抽象，单一时间线）。
+- [x] `worker.py` — `HiclawWorker`（执行 Agent）：构造写 SOUL+skills+Room；执行写 spec.md/result.md/meta.json + Room 通知；LLM 缺失时确定性回退。
+- [x] `scheduler.py` — 纯函数波调度（normalize/build_waves/inject_upstream/环检测），语义对齐现有实现，去 DB 耦合。
+- [x] `manager.py` — `HiclawManager`（调度 Agent）：分解→波调度→派发→收集→上游注入→失败传播；LLM 缺失启发式回退。
+- [x] `mcp.py` — `McpGateway`（Higress MCP 抽象 + 动态权限授予/撤销，撤销返回 403）。
+- [x] `cli.py`/`__main__.py` — `agt` CLI：`create worker/manager`、`get workers/managers`、`run --goal`。
+
+### 验证
+
+- `tests/test_hiclaw.py` 24 项全通过（含 `test_demo_self_check` 端到端）。
+- CLI 端到端冒烟通过：CRD 持久化 + SOUL/skills 物化 + 波调度 + `shared/tasks/*/spec.md|result.md|meta.json` 落盘。
+- 全量非 websockets 测试 145 项通过；8 项 collection 错误为环境缺 `websockets` 包（既有，与本次无关）。
+
+### 与现有实现关系
+
+- 与 `src/core/agents/` 并存；现有为 `local` 运行时，本包为 `hiclaw` 运行时。
+- 复用 `llm_client`（无 Key 自动回退）、`logger`；波调度逻辑抽为纯函数避免拖入 `TaskRepository`。
+- 未触任何 `core/` 文件，零侵入。
+
+### 执行 Agent 底层重建为 hiclaw 驱动（无 runtime 标记）
+
+- [x] `HiclawWorker` 扩展沙箱执行：`_process` 分派 script/command → 复用 `core.sandbox.Sandbox`；返回 `returncode`/`stderr`。
+- [x] `ExecutionAgent` 重建为 hiclaw facade：`initialize` 物化 per-agent `HiclawWorker`（role/system_prompt → SOUL，共享 sandbox）；`run` 委托 `worker.execute`，归一化为 legacy 契约；发 `task.execution_started/planned/completed/failed` 事件。
+- [x] 调用方零改动：`task_runner` / `central_dispatcher` / `agent_manager` 仍用 `ExecutionAgent()` + `initialize({role, system_prompt})`，无 `runtime` 配置。
+
+### 验证（全量）
+
+- `TestExecutionAgent` 7 项原失败用例转绿（sandbox/returncode/events/_plan_execution 契约）。
+- `test_integration.py::test_full_script_execution_flow` 转绿（补 `task.execution_planned` 事件）。
+- `tests/test_hiclaw.py` 24 项全绿；`test_agents.py` 全绿。
+- 全量 248 passed / 2 failed：2 项为 `test_ws_dispatcher` 的 `schedule_forward` 签名漂移（既有，与本次无关，stash 验证）。
+- 2 项 collection error 亦为既有：`test_central_dispatcher` 缺 `GLOBAL_CONSUMER_ID` 符号、`test_execution_server_routing` 缺 `gradio` 包。
+
+### 观点论证推理 (debate) 场景端到端验证
+
+- [x] 新增 `tests/test_debate_scenario.py`：构造 debate 场景（正方/反方/裁判三执行 Agent），经 `scenario_manager` 创建+启动，轮询至终态。
+- [x] 验证项：场景状态 completed；正方/反方论证 + 裁判裁决均非空；正反内容相异；多轮(rounds=2)正常运行。
+- [x] 全程离线：无 DASHSCOPE_API_KEY，ExecutionAgent(hiclaw 底层) 走确定性回退产出论证内容。
+- [x] 3 项全通过（单轮输出校验 + 多轮反驳 + 端到端完成）。未触任何源码，仅新增测试。
